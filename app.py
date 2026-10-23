@@ -2,9 +2,11 @@
 """
 Rasooli University — University Management System.
 
-Single-file Flask application backed by SQLite. On first boot it
-creates the schema, enables WAL + foreign keys, and bootstraps an
-administrator account from environment variables.
+Single-file Flask app on SQLite. On boot it:
+  • detects a legacy (pre-upgrade) database and archives it,
+  • creates the schema (idempotent),
+  • enables WAL + foreign keys,
+  • bootstraps an administrator from env vars.
 """
 
 import os
@@ -32,7 +34,6 @@ app = Flask(__name__)
 
 _secret = os.environ.get("SECRET_KEY")
 if not _secret:
-    # Dev fallback: sessions reset on restart. Set SECRET_KEY in production.
     _secret = secrets.token_hex(32)
     app.logger.warning("SECRET_KEY not set — using an ephemeral key.")
 
@@ -41,12 +42,12 @@ app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
     SESSION_COOKIE_SAMESITE="Lax",
     SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
-    PERMANENT_SESSION_LIFETIME=60 * 60 * 8,     # 8 hours
-    MAX_CONTENT_LENGTH=2 * 1024 * 1024,          # 2 MB request cap
+    PERMANENT_SESSION_LIFETIME=60 * 60 * 8,
+    MAX_CONTENT_LENGTH=2 * 1024 * 1024,
 )
 
 # --------------------------------------------------------------------------- #
-# Schema (idempotent — safe to run on every boot)
+# Schema
 # --------------------------------------------------------------------------- #
 
 SCHEMA_SQL = """
@@ -170,7 +171,6 @@ def close_db(_exc=None):
 
 
 def query(sql: str, args=(), one: bool = False):
-    """Run a SELECT and return dict rows (or a single dict)."""
     cur = get_db().execute(sql, args)
     try:
         rows = cur.fetchall()
@@ -182,7 +182,6 @@ def query(sql: str, args=(), one: bool = False):
 
 
 def execute(sql: str, args=()):
-    """Run a write statement and commit."""
     db = get_db()
     cur = db.execute(sql, args)
     db.commit()
@@ -193,7 +192,8 @@ def execute(sql: str, args=()):
 
 def table_exists(name: str) -> bool:
     return get_db().execute(
-        "SELECT 1 FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+        "SELECT 1 FROM sqlite_master "
+        "WHERE type IN ('table','view') AND name = ?",
         (name,),
     ).fetchone() is not None
 
@@ -211,7 +211,6 @@ def count_rows(name: str) -> int:
 
 
 def paginate(sql: str, args=(), page: int = 1, per_page: int = 25):
-    """Return (rows, meta) for a SELECT with stable ordering."""
     page = max(1, int(page or 1))
     per_page = min(max(1, per_page), 200)
     db = get_db()
@@ -228,12 +227,58 @@ def paginate(sql: str, args=(), page: int = 1, per_page: int = 25):
 
 
 # --------------------------------------------------------------------------- #
-# Schema bootstrap + admin seeding (runs once at import)
+# Schema bootstrap — detects and archives legacy databases
 # --------------------------------------------------------------------------- #
 
+def _table_columns(conn, table: str):
+    return [r[1] for r in conn.execute(f'PRAGMA table_info("{table}")').fetchall()]
+
+
+def _legacy_schema_present() -> bool:
+    """
+    True if DATABASE already contains a `students` table that predates
+    the current schema (missing department_id / student_no / status /
+    enrolled_on). CREATE TABLE IF NOT EXISTS cannot reconcile such a
+    table, so we must start clean.
+    """
+    if not os.path.exists(DATABASE):
+        return False
+    conn = sqlite3.connect(DATABASE)
+    try:
+        row = conn.execute(
+            "SELECT 1 FROM sqlite_master "
+            "WHERE type='table' AND name='students'"
+        ).fetchone()
+        if not row:
+            return False
+        cols = set(_table_columns(conn, "students"))
+        required = {"department_id", "student_no", "status", "enrolled_on"}
+        return not required.issubset(cols)
+    finally:
+        conn.close()
+
+
+def _archive_legacy_db() -> str:
+    ts = time.strftime("%Y%m%d-%H%M%S")
+    backup = f"{DATABASE}.legacy-{ts}.bak"
+    for path in (DATABASE, DATABASE + "-wal", DATABASE + "-shm"):
+        if os.path.exists(path):
+            suffix = path[len(DATABASE):]
+            os.replace(path, backup + suffix)
+    app.logger.warning(
+        "Legacy database archived to %s — a fresh schema will be created. "
+        "Recover rows from that file if needed, then delete it.",
+        backup,
+    )
+    return backup
+
+
 def ensure_schema():
+    if _legacy_schema_present():
+        _archive_legacy_db()
     db = sqlite3.connect(DATABASE)
     try:
+        db.execute("PRAGMA journal_mode = WAL")
         db.execute("PRAGMA foreign_keys = ON")
         db.executescript(SCHEMA_SQL)
         db.commit()
@@ -284,16 +329,15 @@ app.jinja_env.globals["csrf_token"] = csrf_token
 
 
 # --------------------------------------------------------------------------- #
-# Login rate limiting (per-process, best-effort)
+# Login rate limiting
 # --------------------------------------------------------------------------- #
 
-LOGIN_WINDOW = 300           # seconds
+LOGIN_WINDOW = 300
 LOGIN_MAX_FAILS = 10
 _login_fails: dict[str, list[float]] = {}
 
 
 def _client_key() -> str:
-    # Render puts the real IP in X-Forwarded-For.
     fwd = request.headers.get("X-Forwarded-For", "")
     return (fwd.split(",")[0].strip() or request.remote_addr or "unknown")
 
@@ -310,7 +354,7 @@ def record_login_fail(key: str):
 
 
 # --------------------------------------------------------------------------- #
-# Auth decorator
+# Auth
 # --------------------------------------------------------------------------- #
 
 def login_required(view):
@@ -355,8 +399,7 @@ button,.button { display:inline-block; background:#123b63; color:white;
   cursor:pointer; margin-top:12px; font:inherit; }
 button:hover,.button:hover { background:#1b5286; }
 table { width:100%; border-collapse:collapse; background:white; }
-th,td { text-align:left; padding:10px; border-bottom:1px solid #e2e8f0;
-  vertical-align:top; }
+th,td { text-align:left; padding:10px; border-bottom:1px solid #e2e8f0; vertical-align:top; }
 th { background:#eaf0f6; }
 .table-wrap { overflow-x:auto; }
 .message { padding:12px; background:#dcfce7; border-radius:6px; margin-bottom:12px; }
@@ -420,11 +463,6 @@ TABLE_SNIPPET = """
 
 
 def page(title: str, content: str, **ctx) -> str:
-    """
-    Render `content` first (with autoescape), then inject it into PAGE.
-    Dynamic values passed via `ctx` are escaped by Jinja — no `|safe`
-    is ever applied to user or database data.
-    """
     body = render_template_string(content, **ctx)
     return render_template_string(PAGE, title=title, content=body, **ctx)
 
@@ -467,7 +505,6 @@ def login():
             except (ValueError, TypeError):
                 ok = False
         else:
-            # Bootstrap fallback if the users table is empty/misconfigured.
             env_user = os.environ.get("ADMIN_USERNAME")
             env_pw = os.environ.get("ADMIN_PASSWORD")
             env_hash = os.environ.get("ADMIN_PASSWORD_HASH")
@@ -607,7 +644,7 @@ def students():
     q = (request.args.get("q") or "").strip()
     where, args = "", []
     if q:
-        where = ("WHERE full_name LIKE ? OR student_no LIKE ? OR email LIKE ?")
+        where = "WHERE full_name LIKE ? OR student_no LIKE ? OR email LIKE ?"
         like = f"%{q}%"
         args = [like, like, like]
 
@@ -622,9 +659,7 @@ def students():
         <button type="submit">Search</button>
         {% if q %}<a class="button" href="{{ url_for('students') }}">Clear</a>{% endif %}
       </form>
-      <p class="muted">
-        {{ meta.total }} record(s) — page {{ meta.page }} of {{ meta.pages }}.
-      </p>
+      <p class="muted">{{ meta.total }} record(s) — page {{ meta.page }} of {{ meta.pages }}.</p>
       """ + TABLE_SNIPPET + """
       <div class="pager">
         {% if meta.page > 1 %}
@@ -656,9 +691,7 @@ def courses():
 
     content = """
     <div class="card">
-      <p class="muted">
-        {{ meta.total }} course(s) — page {{ meta.page }} of {{ meta.pages }}.
-      </p>
+      <p class="muted">{{ meta.total }} course(s) — page {{ meta.page }} of {{ meta.pages }}.</p>
       """ + TABLE_SNIPPET + """
       <div class="pager">
         {% if meta.page > 1 %}
@@ -685,10 +718,10 @@ def database_info():
         {"name": n, "rows": count_rows(n), "columns": table_columns(n)}
         for n in names
     ]
-
     integrity = db.execute("PRAGMA integrity_check").fetchone()[0]
     fk_issues = len(db.execute("PRAGMA foreign_key_check").fetchall())
-    db_size = f"{Path(DATABASE).stat().st_size / 1024:.1f} KB" if Path(DATABASE).exists() else "n/a"
+    db_size = f"{Path(DATABASE).stat().st_size / 1024:.1f} KB" \
+        if Path(DATABASE).exists() else "n/a"
 
     content = """
     <div class="card">
@@ -745,14 +778,14 @@ def not_found(_err):
     return page(
         "Not found",
         '<div class="card">The page you requested does not exist. '
-        '<a class="button" href="' + url_for("dashboard") + '">Back to dashboard</a></div>',
+        '<a class="button" href="' + url_for("dashboard") + '">Back</a></div>',
     ), 404
 
 
 @app.errorhandler(400)
 def bad_request(err):
     msg = getattr(err, "description", "Bad request.")
-    return page("Bad request", f'<div class="card">{escape(msg)}</div>'), 400
+    return page("Bad request", f'<div class="card">{msg}</div>'), 400
 
 
 @app.errorhandler(sqlite3.IntegrityError)
@@ -769,7 +802,7 @@ def integrity_error(err):
 def http_error(err):
     return page(
         err.name,
-        f'<div class="card">{escape(err.description or "")}</div>',
+        f'<div class="card">{err.description or ""}</div>',
     ), err.code
 
 
@@ -788,5 +821,4 @@ def server_error(err):
 # --------------------------------------------------------------------------- #
 
 if __name__ == "__main__":
-    # Production: gunicorn "app:app" --bind 0.0.0.0:$PORT
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=False)
