@@ -173,6 +173,70 @@ def login():
         username = request.form.get("username", "").strip()
         password = request.form.get("password", "")
 
+        # Read credentials securely from Render environment variables.
+        admin_user = os.environ.get("ADMIN_USERNAME", "")
+        admin_password = os.environ.get("ADMIN_PASSWORD", "")
+        admin_hash = os.environ.get("ADMIN_PASSWORD_HASH", "")
+
+        valid_password = False
+
+        # Option 1: Use a password stored in Render Environment.
+        if admin_password:
+            valid_password = (
+                password == admin_password
+            )
+
+        # Option 2: Support the existing password-hash method.
+        elif admin_hash:
+            try:
+                valid_password = check_password_hash(
+                    admin_hash, password
+                )
+            except (ValueError, TypeError):
+                valid_password = False
+
+        if (
+            admin_user
+            and username == admin_user
+            and valid_password
+        ):
+            session.clear()
+            session["logged_in"] = True
+            session["username"] = username
+            return redirect(url_for("dashboard"))
+
+        flash("Login failed. Please check your username and password.")
+
+    content = """
+    <div class="card">
+      <p>Sign in to Rasooli University Management System.</p>
+
+      <form method="post">
+        <label>Username</label>
+        <input
+          name="username"
+          required
+          autocomplete="username"
+        >
+
+        <label>Password</label>
+        <input
+          type="password"
+          name="password"
+          required
+          autocomplete="current-password"
+        >
+
+        <button type="submit">Sign in</button>
+      </form>
+    </div>
+    """
+
+    return page("Login", content)
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+
         # Configure credentials using environment variables in Render.
         admin_user = os.environ.get("ADMIN_USERNAME")
         admin_hash = os.environ.get("ADMIN_PASSWORD_HASH")
